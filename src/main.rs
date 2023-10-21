@@ -9,12 +9,13 @@ use imap_codec::{
     },
     CommandCodec, GreetingCodec, ResponseCodec,
 };
+use reqwest::header::USER_AGENT;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::ops::Range;
+use std::str;
 use std::thread;
 
 struct Connection<'a> {
@@ -45,15 +46,16 @@ fn capabilities() -> NonEmptyVec<Capability<'static>> {
     NonEmptyVec::try_from(vec![Imap4Rev1, Auth(Plain)]).unwrap()
 }
 
-fn login(username: &[u8], password: &[u8]) -> Result<String, Option<String>> {
+fn login(username: &str, password: &str) -> Result<String, Option<String>> {
     let body = json!({
-        "username": username,
-        "password": password
+        "identifiant": username,
+        "motdepasse": password,
     });
 
     let client = reqwest::blocking::Client::new();
     let response: APIResponse = client
         .post("https://api.ecoledirecte.com/v3/login.awp?v=4.43.0")
+        .header(USER_AGENT, "ecoledirecte-imap")
         .body("data=".to_owned() + &body.to_string())
         .send()
         .unwrap()
@@ -106,7 +108,10 @@ fn process<'a, 'b>(command: Command<'a>, connection: &mut Connection<'b>) -> Vec
                 initial_response,
             } => todo!("AUTHENTICATE {:?} {:?}", mechanism, initial_response),
             Login { username, password } => {
-                match login(username.as_ref(), password.declassify().as_ref()) {
+                match login(
+                    str::from_utf8(username.as_ref()).unwrap(),
+                    str::from_utf8(password.declassify().as_ref()).unwrap(),
+                ) {
                     Ok(token) => {
                         connection.state = State::Authenticated;
                         connection.token = Some(token);
