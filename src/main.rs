@@ -9,6 +9,9 @@ use imap_codec::{
     },
     CommandCodec, GreetingCodec, ResponseCodec,
 };
+use serde::Deserialize;
+use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::ops::Range;
@@ -28,9 +31,40 @@ impl<'a> Default for Connection<'a> {
     }
 }
 
+#[derive(Deserialize, Debug)]
+struct APIResponse {
+    host: Option<String>,
+    code: u32,
+    token: String,
+    message: Option<String>,
+    data: Value,
+}
+
 fn capabilities() -> NonEmptyVec<Capability<'static>> {
     use imap_codec::imap_types::{auth::AuthMechanism::*, response::Capability::*};
     NonEmptyVec::try_from(vec![Imap4Rev1, Auth(Plain)]).unwrap()
+}
+
+fn login(username: &[u8], password: &[u8]) -> Result<String, Option<String>> {
+    let body = json!({
+        "username": username,
+        "password": password
+    });
+
+    let client = reqwest::blocking::Client::new();
+    let response: APIResponse = client
+        .post("https://api.ecoledirecte.com/v3/login.awp?v=4.43.0")
+        .body("data=".to_owned() + &body.to_string())
+        .send()
+        .unwrap()
+        .json()
+        .unwrap();
+
+    if response.code == 200 {
+        Ok(response.token)
+    } else {
+        Err(response.message)
+    }
 }
 
 fn process<'a, 'b>(command: Command<'a>, connection: &mut Connection<'b>) -> Vec<Response<'a>> {
@@ -71,7 +105,35 @@ fn process<'a, 'b>(command: Command<'a>, connection: &mut Connection<'b>) -> Vec
                 mechanism,
                 initial_response,
             } => todo!("AUTHENTICATE {:?} {:?}", mechanism, initial_response),
-            Login { username, password } => todo!("LOGIN {:?} {:?}", username, password),
+            Login { username, password } => {
+                match login(username.as_ref(), password.declassify().as_ref()) {
+                    Ok(token) => {
+                        connection.state = State::Authenticated;
+                        connection.token = Some(token);
+                        return vec![Response::Status(
+                            Status::ok(
+                                Some(command.tag),
+                                Some(Code::Capability(capabilities())),
+                                "LOGIN completed",
+                            )
+                            .unwrap(),
+                        )];
+                    }
+                    Err(message) => {
+                        return vec![Response::Status(
+                            Status::no(
+                                Some(command.tag),
+                                None,
+                                match message {
+                                    Some(message) => format!("LOGIN failed: {}", message),
+                                    None => String::from("LOGIN failed"),
+                                },
+                            )
+                            .unwrap(),
+                        )];
+                    }
+                }
+            }
             _ => (),
         }
     }
@@ -163,6 +225,8 @@ fn responder<'a>(mut stream: TcpStream, mut connection: Connection<'a>) {
                 .dump(),
         )
         .unwrap();
+
+    connection.state = State::NotAuthenticated;
 
     loop {
         match CommandCodec::default().decode(&buffer[..cursor]) {
