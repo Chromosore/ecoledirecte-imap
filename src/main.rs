@@ -1,17 +1,22 @@
 use imap_codec::{
-    decode::{CommandDecodeError, Decoder},
+    decode::{AuthenticateDataDecodeError, CommandDecodeError, Decoder},
     encode::Encoder,
     imap_types::{
+        auth::AuthMechanism,
         command::Command,
         core::{NonEmptyVec, Text},
-        response::{Capability, Code, Data, Greeting, GreetingKind, Response, Status},
+        response::{
+            Capability, Code, CommandContinuationRequest, Data, Greeting, GreetingKind, Response,
+            Status,
+        },
         state::State,
     },
-    CommandCodec, GreetingCodec, ResponseCodec,
+    AuthenticateDataCodec, CommandCodec, GreetingCodec, ResponseCodec,
 };
 use reqwest::header::USER_AGENT;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::borrow::Cow;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::ops::Range;
@@ -69,7 +74,11 @@ fn login(username: &str, password: &str) -> Result<String, Option<String>> {
     }
 }
 
-fn process<'a, 'b>(command: Command<'a>, connection: &mut Connection<'b>) -> Vec<Response<'a>> {
+fn process<'a>(
+    command: Command<'a>,
+    connection: &mut Connection<'_>,
+    stream: &mut TcpStream,
+) -> Vec<Response<'a>> {
     use imap_codec::imap_types::{
         command::CommandBody::*,
         command::CommandBody::{Logout, Status as StatusCommand},
@@ -106,7 +115,126 @@ fn process<'a, 'b>(command: Command<'a>, connection: &mut Connection<'b>) -> Vec
             Authenticate {
                 mechanism,
                 initial_response,
-            } => todo!("AUTHENTICATE {:?} {:?}", mechanism, initial_response),
+            } => {
+                if mechanism != AuthMechanism::Plain {
+                    return vec![Response::Status(
+                        Status::no(Some(command.tag), None, "Unsupported mechanism").unwrap(),
+                    )];
+                }
+                if initial_response != None {
+                    return vec![Response::Status(
+                        Status::no(Some(command.tag), None, "Unexpected initial response").unwrap(),
+                    )];
+                }
+
+                stream
+                    .write(
+                        &ResponseCodec::default()
+                            .encode(&Response::CommandContinuationRequest(
+                                CommandContinuationRequest::Base64(Cow::Borrowed(&[])),
+                            ))
+                            .dump(),
+                    )
+                    .unwrap();
+
+                let mut buffer = [0u8; 1024];
+                let mut consummed = 0;
+                let mut peeked;
+
+                peeked = stream.peek(&mut buffer).unwrap();
+
+                // Le problème est de consommer juste la bonne quantité de données
+                // pour que le reste soit géré par la boucle principale
+                // On pourrait utiliser juste peek puis consommer ce qui a été con-
+                // sommé par le codec mais le problème est que peek ne bloque pas
+                // et donc on attendrait en boucle quand il manque des données.
+                // La solution: peek pour obtenir des données (puisque quand il n'y
+                // a pas de données disponibles peek bloque) puis si c'est pas suf-
+                // fisant, on read() les données pour les consommer (puisqu'on sait
+                // qu'on les utilise de toute manière) et on peek à nouveau.
+                let line = loop {
+                    match AuthenticateDataCodec::default().decode(&buffer[..peeked]) {
+                        Ok((remaining, line)) => {
+                            // unwrap: ok puisque remaining est une slice de buffer
+                            let range = remaining.as_range_of(&buffer).unwrap();
+                            // unwrap: ok puisque déjà peeked
+                            stream.read(&mut buffer[consummed..range.start]).unwrap();
+                            break line;
+                        }
+                        Err(AuthenticateDataDecodeError::Incomplete) => {
+                            if peeked >= buffer.len() {
+                                todo!("OUT OF MEMORY");
+                            }
+                            // unwrap: ok puisque déjà peeked
+                            stream.read(&mut buffer[consummed..peeked]).unwrap();
+                            consummed = peeked;
+                            let received = stream.peek(&mut buffer[consummed..]).unwrap();
+                            if received == 0 {
+                                return vec![];
+                            }
+                            peeked += received;
+                        }
+                        Err(AuthenticateDataDecodeError::Failed) => {
+                            stream.read(&mut buffer[consummed..peeked]).unwrap();
+                            return vec![Response::Status(
+                                Status::bad(Some(command.tag), None, "Invalid BASE64 literal")
+                                    .unwrap(),
+                            )];
+                        }
+                    }
+                };
+
+                /* AuthenticateDataCodec ne gère par "*" mais l'erreur failed le gère
+                 * (pour la mauvaise raison :p)
+                 */
+
+                let parts: Vec<_> = line.0.declassify().split(|c| *c == 0).collect();
+                if parts.len() != 3 {
+                    return vec![Response::Status(
+                        Status::no(Some(command.tag), None, "Invalid challenge").unwrap(),
+                    )];
+                }
+                let identity = parts[0];
+                let username = parts[1];
+                let password = parts[2];
+
+                if identity != "".as_bytes() && identity != username {
+                    return vec![Response::Status(
+                        Status::no(Some(command.tag), None, "Invalid identity").unwrap(),
+                    )];
+                }
+
+                match login(
+                    str::from_utf8(username).unwrap(),
+                    str::from_utf8(password).unwrap(),
+                ) {
+                    Ok(token) => {
+                        connection.state = State::Authenticated;
+                        connection.token = Some(token);
+                        return vec![Response::Status(
+                            Status::ok(
+                                Some(command.tag),
+                                Some(Code::Capability(capabilities())),
+                                "AUTHENTICATE completed",
+                            )
+                            .unwrap(),
+                        )];
+                    }
+                    Err(message) => {
+                        return vec![Response::Status(
+                            Status::no(
+                                Some(command.tag),
+                                None,
+                                match message {
+                                    Some(message) => format!("AUTHENTICATE failed: {}", message),
+                                    None => String::from("AUTHENTICATE failed"),
+                                },
+                            )
+                            .unwrap(),
+                        )];
+                    }
+                }
+            }
             Login { username, password } => {
                 match login(
                     str::from_utf8(username.as_ref()).unwrap(),
@@ -215,7 +343,7 @@ impl<T> AsRange for [T] {
     }
 }
 
-fn responder<'a>(mut stream: TcpStream, mut connection: Connection<'a>) {
+fn responder(mut stream: TcpStream, mut connection: Connection<'_>) {
     let mut buffer = [0u8; 1024];
     let mut cursor = 0;
 
@@ -236,7 +364,7 @@ fn responder<'a>(mut stream: TcpStream, mut connection: Connection<'a>) {
     loop {
         match CommandCodec::default().decode(&buffer[..cursor]) {
             Ok((remaining, command)) => {
-                for response in process(command, &mut connection) {
+                for response in process(command, &mut connection, &mut stream) {
                     stream
                         .write(&ResponseCodec::default().encode(&response).dump())
                         .unwrap();
