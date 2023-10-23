@@ -6,6 +6,7 @@ use imap_codec::{
         auth::AuthMechanism,
         command::Command,
         core::{NonEmptyVec, Text},
+        flag::{Flag, FlagPerm},
         mailbox::{ListMailbox, Mailbox},
         response::{
             Capability, Code, CommandContinuationRequest, Data, Greeting, GreetingKind, Response,
@@ -344,7 +345,28 @@ fn process<'a>(
 
     if let Authenticated | Selected(_) = connection.state {
         match command.body {
-            Select { mailbox } => todo!("SELECT {:?}", mailbox),
+            Select { mailbox } => {
+                return vec![
+                    Response::Data(Data::Flags(vec![Flag::Seen, Flag::Answered, Flag::Draft])),
+                    Response::Data(Data::Exists(0)),
+                    Response::Data(Data::Recent(0)),
+                    Response::Status(
+                        Status::ok(
+                            None,
+                            Some(Code::PermanentFlags(vec![
+                                FlagPerm::Flag(Flag::Seen),
+                                FlagPerm::Flag(Flag::Draft),
+                            ])),
+                            "Flags",
+                        )
+                        .unwrap(),
+                    ),
+                    Response::Status(
+                        Status::ok(Some(command.tag), Some(Code::ReadWrite), "SELECT completed")
+                            .unwrap(),
+                    ),
+                ];
+            }
             Examine { mailbox } => todo!("EXAMINE {:?}", mailbox),
             Create { mailbox } => todo!("CREATE {:?}", mailbox),
             Delete { mailbox } => todo!("DELETE {:?}", mailbox),
