@@ -2,9 +2,11 @@ use imap_codec::{
     decode::{AuthenticateDataDecodeError, CommandDecodeError, Decoder},
     encode::Encoder,
     imap_types::{
+        self,
         auth::AuthMechanism,
         command::Command,
         core::{NonEmptyVec, Text},
+        mailbox::{ListMailbox, Mailbox},
         response::{
             Capability, Code, CommandContinuationRequest, Data, Greeting, GreetingKind, Response,
             Status,
@@ -25,6 +27,7 @@ use std::thread;
 
 struct Connection<'a> {
     state: State<'a>,
+    id: Option<u32>,
     token: Option<String>,
 }
 
@@ -32,33 +35,44 @@ impl<'a> Default for Connection<'a> {
     fn default() -> Connection<'a> {
         Connection {
             state: State::Greeting,
+            id: None,
             token: None,
         }
     }
 }
 
 #[derive(Deserialize, Debug)]
-struct APIResponse {
+struct APIResponse<Data> {
     host: Option<String>,
     code: u32,
     token: String,
     message: Option<String>,
-    data: Value,
+    data: Data,
+}
+
+#[derive(Deserialize)]
+struct LoginData {
+    accounts: Vec<Account>,
+}
+
+#[derive(Deserialize)]
+struct Account {
+    id: u32,
 }
 
 fn capabilities() -> NonEmptyVec<Capability<'static>> {
-    use imap_codec::imap_types::{auth::AuthMechanism::*, response::Capability::*};
+    use imap_types::{auth::AuthMechanism::*, response::Capability::*};
     NonEmptyVec::try_from(vec![Imap4Rev1, Auth(Plain)]).unwrap()
 }
 
-fn login(username: &str, password: &str) -> Result<String, Option<String>> {
+fn login(username: &str, password: &str) -> Result<(u32, String), Option<String>> {
     let body = json!({
         "identifiant": username,
         "motdepasse": password,
     });
 
     let client = reqwest::blocking::Client::new();
-    let response: APIResponse = client
+    let response: APIResponse<LoginData> = client
         .post("https://api.ecoledirecte.com/v3/login.awp?v=4.43.0")
         .header(USER_AGENT, "ecoledirecte-imap")
         .body("data=".to_owned() + &body.to_string())
@@ -68,10 +82,51 @@ fn login(username: &str, password: &str) -> Result<String, Option<String>> {
         .unwrap();
 
     if response.code == 200 {
-        Ok(response.token)
+        Ok((response.data.accounts[0].id, response.token))
     } else {
         Err(response.message)
     }
+}
+
+#[derive(Deserialize)]
+struct APIClasseurs {
+    classeurs: Vec<APIClasseur>,
+}
+
+#[derive(Deserialize)]
+struct APIClasseur {
+    id: u32,
+    libelle: String,
+}
+
+fn get_folders(id: u32, token: String) -> Vec<String> {
+    let body = json!({
+        "anneeMessage": "2022-2023", // TODO!!!
+    });
+
+    let client = reqwest::blocking::Client::new();
+    let response: APIResponse<APIClasseurs> = client
+        .post(format!(
+            "https://api.ecoledirecte.com/v3/eleves/{id}/messages.awp?verbe=get&v=4.43.0"
+        ))
+        .header(USER_AGENT, "ecoledirecte-imap")
+        .header("X-Token", token)
+        .body("data=".to_owned() + &body.to_string())
+        .send()
+        .unwrap()
+        .json()
+        .unwrap();
+
+    response
+        .data
+        .classeurs
+        .into_iter()
+        .map(|classeur| classeur.libelle)
+        .collect()
+}
+
+fn list(folders: Vec<String>, reference: Mailbox<'_>, mailbox_wildcard: &[u8]) -> Vec<String> {
+    folders // TODO!!!
 }
 
 fn process<'a>(
@@ -79,7 +134,7 @@ fn process<'a>(
     connection: &mut Connection<'_>,
     stream: &mut TcpStream,
 ) -> Vec<Response<'a>> {
-    use imap_codec::imap_types::{
+    use imap_types::{
         command::CommandBody::*,
         command::CommandBody::{Logout, Status as StatusCommand},
         response::Status,
@@ -208,8 +263,9 @@ fn process<'a>(
                     str::from_utf8(username).unwrap(),
                     str::from_utf8(password).unwrap(),
                 ) {
-                    Ok(token) => {
+                    Ok((id, token)) => {
                         connection.state = State::Authenticated;
+                        connection.id = Some(id);
                         connection.token = Some(token);
                         return vec![Response::Status(
                             Status::ok(
@@ -240,8 +296,9 @@ fn process<'a>(
                     str::from_utf8(username.as_ref()).unwrap(),
                     str::from_utf8(password.declassify().as_ref()).unwrap(),
                 ) {
-                    Ok(token) => {
+                    Ok((id, token)) => {
                         connection.state = State::Authenticated;
+                        connection.id = Some(id);
                         connection.token = Some(token);
                         return vec![Response::Status(
                             Status::ok(
@@ -281,7 +338,51 @@ fn process<'a>(
             List {
                 reference,
                 mailbox_wildcard,
-            } => todo!("LIST {:?} {:?}", reference, mailbox_wildcard),
+            } => {
+                use imap_types::flag::FlagNameAttribute::Noselect;
+                let name = match mailbox_wildcard {
+                    ListMailbox::String(ref name) => name.as_ref(),
+                    ListMailbox::Token(ref name) => name.as_ref(),
+                };
+
+                if name.len() == 0 {
+                    return vec![
+                        Response::Data(Data::List {
+                            items: vec![Noselect],
+                            delimiter: None,
+                            mailbox: Mailbox::try_from("").unwrap(),
+                        }),
+                        Response::Status(
+                            Status::ok(Some(command.tag), None, "LIST completed").unwrap(),
+                        ),
+                    ];
+                }
+
+                let mut response: Vec<_> = list(
+                    get_folders(connection.id.unwrap(), connection.token.clone().unwrap()),
+                    reference,
+                    name,
+                )
+                .into_iter()
+                .map(|classeur: String| {
+                    Response::Data(Data::List {
+                        items: vec![],
+                        delimiter: None,
+                        mailbox: Mailbox::try_from(classeur).unwrap(),
+                    })
+                })
+                .collect();
+
+                response.push(Response::Data(Data::List {
+                    items: vec![],
+                    delimiter: None,
+                    mailbox: Mailbox::Inbox,
+                }));
+                response.push(Response::Status(
+                    Status::ok(Some(command.tag), None, "LIST completed").unwrap(),
+                ));
+                return response;
+            }
             StatusCommand {
                 mailbox,
                 item_names,
