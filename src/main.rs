@@ -465,7 +465,15 @@ fn responder(mut stream: TcpStream, mut connection: Connection<'_>) {
     loop {
         match CommandCodec::default().decode(&buffer[..cursor]) {
             Ok((remaining, command)) => {
+                print!(
+                    "C: {}",
+                    str::from_utf8(&CommandCodec::default().encode(&command).dump()).unwrap()
+                );
                 for response in process(command, &mut connection, &mut stream) {
+                    print!(
+                        "S: {}",
+                        str::from_utf8(&ResponseCodec::default().encode(&response).dump()).unwrap()
+                    );
                     stream
                         .write(&ResponseCodec::default().encode(&response).dump())
                         .unwrap();
