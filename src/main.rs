@@ -41,92 +41,106 @@ impl<'a> Default for Connection<'a> {
     }
 }
 
-#[derive(Deserialize, Debug)]
-struct APIResponse<Data> {
-    host: Option<String>,
-    code: u32,
-    token: String,
-    message: Option<String>,
-    data: Data,
-}
+fn main() {
+    let listener = TcpListener::bind("localhost:1993").unwrap();
 
-#[derive(Deserialize)]
-struct LoginData {
-    accounts: Vec<Account>,
-}
+    thread::scope(|s| {
+        for stream in listener.incoming() {
+            let stream = stream.unwrap();
 
-#[derive(Deserialize)]
-struct Account {
-    id: u32,
-}
-
-fn capabilities() -> NonEmptyVec<Capability<'static>> {
-    use imap_types::{auth::AuthMechanism::*, response::Capability::*};
-    NonEmptyVec::try_from(vec![Imap4Rev1, Auth(Plain)]).unwrap()
-}
-
-fn login(username: &str, password: &str) -> Result<(u32, String), Option<String>> {
-    let body = json!({
-        "identifiant": username,
-        "motdepasse": password,
+            s.spawn(|| responder(stream, Connection::default()));
+        }
     });
+}
 
-    let client = reqwest::blocking::Client::new();
-    let response: APIResponse<LoginData> = client
-        .post("https://api.ecoledirecte.com/v3/login.awp?v=4.43.0")
-        .header(USER_AGENT, "ecoledirecte-imap")
-        .body("data=".to_owned() + &body.to_string())
-        .send()
-        .unwrap()
-        .json()
-        .unwrap();
+trait AsRange {
+    fn as_range_of(&self, other: &Self) -> Option<Range<usize>>;
+}
 
-    if response.code == 200 {
-        Ok((response.data.accounts[0].id, response.token))
-    } else {
-        Err(response.message)
+impl<T> AsRange for [T] {
+    fn as_range_of(&self, other: &[T]) -> Option<Range<usize>> {
+        let self_ = self.as_ptr_range();
+        let other = other.as_ptr_range();
+        if other.start > self_.start || self_.end > other.end {
+            None
+        } else {
+            let from = unsafe { self_.start.offset_from(other.start) };
+            let to = unsafe { self_.end.offset_from(other.start) };
+            Some((from as usize)..(to as usize))
+        }
     }
 }
 
-#[derive(Deserialize)]
-struct APIClasseurs {
-    classeurs: Vec<APIClasseur>,
-}
+fn responder(mut stream: TcpStream, mut connection: Connection<'_>) {
+    let mut buffer = [0u8; 1024];
+    let mut cursor = 0;
 
-#[derive(Deserialize)]
-struct APIClasseur {
-    id: u32,
-    libelle: String,
-}
-
-fn get_folders(id: u32, token: String) -> Vec<String> {
-    let body = json!({
-        "anneeMessage": "2022-2023", // TODO!!!
-    });
-
-    let client = reqwest::blocking::Client::new();
-    let response: APIResponse<APIClasseurs> = client
-        .post(format!(
-            "https://api.ecoledirecte.com/v3/eleves/{id}/messages.awp?verbe=get&v=4.43.0"
-        ))
-        .header(USER_AGENT, "ecoledirecte-imap")
-        .header("X-Token", token)
-        .body("data=".to_owned() + &body.to_string())
-        .send()
-        .unwrap()
-        .json()
+    stream
+        .write(
+            &GreetingCodec::default()
+                .encode(&Greeting {
+                    kind: GreetingKind::Ok,
+                    code: Some(Code::Capability(capabilities())),
+                    text: Text::try_from("ecoledirecte-imap ready").unwrap(),
+                })
+                .dump(),
+        )
         .unwrap();
 
-    response
-        .data
-        .classeurs
-        .into_iter()
-        .map(|classeur| classeur.libelle)
-        .collect()
-}
+    connection.state = State::NotAuthenticated;
 
-fn list(folders: Vec<String>, reference: Mailbox<'_>, mailbox_wildcard: &[u8]) -> Vec<String> {
-    folders // TODO!!!
+    loop {
+        match CommandCodec::default().decode(&buffer[..cursor]) {
+            Ok((remaining, command)) => {
+                print!(
+                    "C: {}",
+                    str::from_utf8(&CommandCodec::default().encode(&command).dump()).unwrap()
+                );
+                for response in process(command, &mut connection, &mut stream) {
+                    print!(
+                        "S: {}",
+                        str::from_utf8(&ResponseCodec::default().encode(&response).dump()).unwrap()
+                    );
+                    stream
+                        .write(&ResponseCodec::default().encode(&response).dump())
+                        .unwrap();
+                }
+
+                if let State::Logout = connection.state {
+                    break;
+                }
+
+                let range = remaining.as_range_of(&buffer).unwrap();
+                cursor = range.len();
+                buffer.copy_within(range, 0);
+            }
+            Err(CommandDecodeError::LiteralFound { tag, length, mode }) => {
+                todo!("LITERAL {:?} {} {:?}", tag, length, mode)
+            }
+            Err(CommandDecodeError::Incomplete) => {
+                if cursor >= buffer.len() {
+                    todo!("OUT OF MEMORY!");
+                }
+                let received = stream.read(&mut buffer[cursor..]).unwrap();
+                if received == 0 {
+                    break;
+                }
+                cursor += received;
+            }
+            Err(CommandDecodeError::Failed) => {
+                stream
+                    .write(
+                        &ResponseCodec::default()
+                            .encode(&Response::Status(
+                                Status::bad(None, None, "Parsing failed").unwrap(),
+                            ))
+                            .dump(),
+                    )
+                    .unwrap();
+                cursor = 0;
+            }
+        }
+    }
 }
 
 fn process<'a>(
@@ -426,104 +440,90 @@ fn process<'a>(
     )]
 }
 
-trait AsRange {
-    fn as_range_of(&self, other: &Self) -> Option<Range<usize>>;
+#[derive(Deserialize, Debug)]
+struct APIResponse<Data> {
+    host: Option<String>,
+    code: u32,
+    token: String,
+    message: Option<String>,
+    data: Data,
 }
 
-impl<T> AsRange for [T] {
-    fn as_range_of(&self, other: &[T]) -> Option<Range<usize>> {
-        let self_ = self.as_ptr_range();
-        let other = other.as_ptr_range();
-        if other.start > self_.start || self_.end > other.end {
-            None
-        } else {
-            let from = unsafe { self_.start.offset_from(other.start) };
-            let to = unsafe { self_.end.offset_from(other.start) };
-            Some((from as usize)..(to as usize))
-        }
-    }
+#[derive(Deserialize)]
+struct LoginData {
+    accounts: Vec<Account>,
 }
 
-fn responder(mut stream: TcpStream, mut connection: Connection<'_>) {
-    let mut buffer = [0u8; 1024];
-    let mut cursor = 0;
+#[derive(Deserialize)]
+struct Account {
+    id: u32,
+}
 
-    stream
-        .write(
-            &GreetingCodec::default()
-                .encode(&Greeting {
-                    kind: GreetingKind::Ok,
-                    code: Some(Code::Capability(capabilities())),
-                    text: Text::try_from("ecoledirecte-imap ready").unwrap(),
-                })
-                .dump(),
-        )
+fn capabilities() -> NonEmptyVec<Capability<'static>> {
+    use imap_types::{auth::AuthMechanism::*, response::Capability::*};
+    NonEmptyVec::try_from(vec![Imap4Rev1, Auth(Plain)]).unwrap()
+}
+
+fn login(username: &str, password: &str) -> Result<(u32, String), Option<String>> {
+    let body = json!({
+        "identifiant": username,
+        "motdepasse": password,
+    });
+
+    let client = reqwest::blocking::Client::new();
+    let response: APIResponse<LoginData> = client
+        .post("https://api.ecoledirecte.com/v3/login.awp?v=4.43.0")
+        .header(USER_AGENT, "ecoledirecte-imap")
+        .body("data=".to_owned() + &body.to_string())
+        .send()
+        .unwrap()
+        .json()
         .unwrap();
 
-    connection.state = State::NotAuthenticated;
-
-    loop {
-        match CommandCodec::default().decode(&buffer[..cursor]) {
-            Ok((remaining, command)) => {
-                print!(
-                    "C: {}",
-                    str::from_utf8(&CommandCodec::default().encode(&command).dump()).unwrap()
-                );
-                for response in process(command, &mut connection, &mut stream) {
-                    print!(
-                        "S: {}",
-                        str::from_utf8(&ResponseCodec::default().encode(&response).dump()).unwrap()
-                    );
-                    stream
-                        .write(&ResponseCodec::default().encode(&response).dump())
-                        .unwrap();
-                }
-
-                if let State::Logout = connection.state {
-                    break;
-                }
-
-                let range = remaining.as_range_of(&buffer).unwrap();
-                cursor = range.len();
-                buffer.copy_within(range, 0);
-            }
-            Err(CommandDecodeError::LiteralFound { tag, length, mode }) => {
-                todo!("LITERAL {:?} {} {:?}", tag, length, mode)
-            }
-            Err(CommandDecodeError::Incomplete) => {
-                if cursor >= buffer.len() {
-                    todo!("OUT OF MEMORY!");
-                }
-                let received = stream.read(&mut buffer[cursor..]).unwrap();
-                if received == 0 {
-                    break;
-                }
-                cursor += received;
-            }
-            Err(CommandDecodeError::Failed) => {
-                stream
-                    .write(
-                        &ResponseCodec::default()
-                            .encode(&Response::Status(
-                                Status::bad(None, None, "Parsing failed").unwrap(),
-                            ))
-                            .dump(),
-                    )
-                    .unwrap();
-                cursor = 0;
-            }
-        }
+    if response.code == 200 {
+        Ok((response.data.accounts[0].id, response.token))
+    } else {
+        Err(response.message)
     }
 }
 
-fn main() {
-    let listener = TcpListener::bind("localhost:1993").unwrap();
+#[derive(Deserialize)]
+struct APIClasseurs {
+    classeurs: Vec<APIClasseur>,
+}
 
-    thread::scope(|s| {
-        for stream in listener.incoming() {
-            let stream = stream.unwrap();
+#[derive(Deserialize)]
+struct APIClasseur {
+    id: u32,
+    libelle: String,
+}
 
-            s.spawn(|| responder(stream, Connection::default()));
-        }
+fn get_folders(id: u32, token: String) -> Vec<String> {
+    let body = json!({
+        "anneeMessage": "2022-2023", // TODO!!!
     });
+
+    let client = reqwest::blocking::Client::new();
+    let response: APIResponse<APIClasseurs> = client
+        .post(format!(
+            "https://api.ecoledirecte.com/v3/eleves/{id}/messages.awp?verbe=get&v=4.43.0"
+        ))
+        .header(USER_AGENT, "ecoledirecte-imap")
+        .header("X-Token", token)
+        .body("data=".to_owned() + &body.to_string())
+        .send()
+        .unwrap()
+        .json()
+        .unwrap();
+
+    response
+        .data
+        .classeurs
+        .into_iter()
+        .map(|classeur| classeur.libelle)
+        .collect()
+}
+
+fn list(folders: Vec<String>, reference: Mailbox<'_>, mailbox_wildcard: &[u8]) -> Vec<String> {
+    folders // TODO!!!
 }
