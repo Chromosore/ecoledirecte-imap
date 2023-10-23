@@ -208,7 +208,7 @@ fn process<'a>(
                     .unwrap();
 
                 let mut buffer = [0u8; 1024];
-                let mut consummed = 0;
+                let mut consumed = 0;
                 let mut peeked;
 
                 peeked = stream.peek(&mut buffer).unwrap();
@@ -228,7 +228,7 @@ fn process<'a>(
                             // unwrap: ok puisque remaining est une slice de buffer
                             let range = remaining.as_range_of(&buffer).unwrap();
                             // unwrap: ok puisque déjà peeked
-                            stream.read(&mut buffer[consummed..range.start]).unwrap();
+                            stream.read(&mut buffer[consumed..range.start]).unwrap();
                             break line;
                         }
                         Err(AuthenticateDataDecodeError::Incomplete) => {
@@ -236,16 +236,16 @@ fn process<'a>(
                                 todo!("OUT OF MEMORY");
                             }
                             // unwrap: ok puisque déjà peeked
-                            stream.read(&mut buffer[consummed..peeked]).unwrap();
-                            consummed = peeked;
-                            let received = stream.peek(&mut buffer[consummed..]).unwrap();
+                            stream.read(&mut buffer[consumed..peeked]).unwrap();
+                            consumed = peeked;
+                            let received = stream.peek(&mut buffer[consumed..]).unwrap();
                             if received == 0 {
                                 return vec![];
                             }
                             peeked += received;
                         }
                         Err(AuthenticateDataDecodeError::Failed) => {
-                            stream.read(&mut buffer[consummed..peeked]).unwrap();
+                            stream.read(&mut buffer[consumed..peeked]).unwrap();
                             return vec![Response::Status(
                                 Status::bad(Some(command.tag), None, "Invalid BASE64 literal")
                                     .unwrap(),
