@@ -207,6 +207,18 @@ fn process<'a>(
                     )
                     .unwrap();
 
+                // TODO: Malgré cette tentative de faire marcher les choses (voir commentaire suivant),
+                // ça va pas :
+                // Si le client envoie un paquet AAABBB avec AAA une commande AUTHENTICATE PLAIN
+                // normalement on devrait lire BBB pour avoir les données d'authentification
+                // mais ici on n'y a pas accès (elles sont dans le buffer de la boucle principale)
+                // donc on se retrouvera à lire CCC d'un autre paquet
+                // Donc la gestion totale pour AAABBB, CCC... serait AAA, CCC, BBB, ...
+                // ce qui ne va clairement pas (même si en pratique si le client est bien discipliné
+                // il devrait attendre de recevoir la confirmation du serveur pour envoyer les données
+                // d'authentification. il y a quand même de quoi améliorer les choses + aussi les
+                // littéraux non-synchronisants poseraient problème (mais je sais pas s'ils peuvent
+                // être utilisés pendant l'authentification))
                 let mut buffer = [0u8; 1024];
                 let mut consumed = 0;
                 let mut peeked;
