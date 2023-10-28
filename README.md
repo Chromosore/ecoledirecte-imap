@@ -37,7 +37,5 @@ Extensions potentielles :
 Il y a d'autres commandes dans la spécification IMAP mais la nature même de la messagerie EcoleDirecte ne permet pas de les faire fonctionner. En gros, tout ce qui concerne l'ajout ou la suppression de message.
 
 Autres choses à faire (notes de dev) :
- - [ ] Nettoyer tout ça (mettre dans des fichiers séparés parce que là c'est n'importe quoi)
- - [ ] Faire un client de l'API digne de ce nom
  - [ ] Async !
- - [ ] Utiliser un truc plus robuste pour les messages (Framed de tokio_util)
+ - [ ] Utiliser un truc plus robuste pour les messages (Framed de tokio_util) avec un moyen de faire stream.read_message(ReponseCodec) ET stream.read_message(AuthenticateDataCodec) puisque ça résout direct la complexité d'Authenticate

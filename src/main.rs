@@ -5,20 +5,17 @@ use imap_codec::{
         self,
         auth::AuthMechanism,
         command::Command,
-        core::{NonEmptyVec, Text},
+        core::Text,
         flag::{Flag, FlagPerm},
         mailbox::{ListMailbox, Mailbox},
         response::{
-            Capability, Code, CommandContinuationRequest, Data, Greeting, GreetingKind, Response,
-            Status,
+            Code, CommandContinuationRequest, Data, Greeting, GreetingKind, Response, Status,
         },
+        secret::Secret,
         state::State,
     },
     AuthenticateDataCodec, CommandCodec, GreetingCodec, ResponseCodec,
 };
-use reqwest::header::USER_AGENT;
-use serde::Deserialize;
-use serde_json::{json, Value};
 use std::borrow::Cow;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -26,30 +23,33 @@ use std::ops::Range;
 use std::str;
 use std::thread;
 
+use ecoledirecte_imap::api;
+use ecoledirecte_imap::auth;
+use ecoledirecte_imap::capabilities;
+
 struct Connection<'a> {
     state: State<'a>,
-    id: Option<u32>,
-    token: Option<String>,
+    user: Option<auth::User>,
 }
 
 impl<'a> Default for Connection<'a> {
     fn default() -> Connection<'a> {
         Connection {
             state: State::Greeting,
-            id: None,
-            token: None,
+            user: None,
         }
     }
 }
 
 fn main() {
     let listener = TcpListener::bind("localhost:1993").unwrap();
+    let client = reqwest::blocking::Client::new();
 
     thread::scope(|s| {
         for stream in listener.incoming() {
             let stream = stream.unwrap();
 
-            s.spawn(|| responder(stream, Connection::default()));
+            s.spawn(|| responder(stream, Connection::default(), &client));
         }
     });
 }
@@ -72,7 +72,11 @@ impl<T> AsRange for [T] {
     }
 }
 
-fn responder(mut stream: TcpStream, mut connection: Connection<'_>) {
+fn responder(
+    mut stream: TcpStream,
+    mut connection: Connection<'_>,
+    client: &reqwest::blocking::Client,
+) {
     let mut buffer = [0u8; 1024];
     let mut cursor = 0;
 
@@ -97,7 +101,7 @@ fn responder(mut stream: TcpStream, mut connection: Connection<'_>) {
                     "C: {}",
                     str::from_utf8(&CommandCodec::default().encode(&command).dump()).unwrap()
                 );
-                for response in process(command, &mut connection, &mut stream) {
+                for response in process(command, &mut connection, &mut stream, client) {
                     print!(
                         "S: {}",
                         str::from_utf8(&ResponseCodec::default().encode(&response).dump()).unwrap()
@@ -148,6 +152,7 @@ fn process<'a>(
     command: Command<'a>,
     connection: &mut Connection<'_>,
     stream: &mut TcpStream,
+    client: &reqwest::blocking::Client,
 ) -> Vec<Response<'a>> {
     use imap_types::{
         command::CommandBody::*,
@@ -269,87 +274,36 @@ fn process<'a>(
                 /* AuthenticateDataCodec ne gère par "*" mais l'erreur failed le gère
                  * (pour la mauvaise raison :p)
                  */
-
-                let parts: Vec<_> = line.0.declassify().split(|c| *c == 0).collect();
-                if parts.len() != 3 {
-                    return vec![Response::Status(
-                        Status::no(Some(command.tag), None, "Invalid challenge").unwrap(),
-                    )];
-                }
-                let identity = parts[0];
-                let username = parts[1];
-                let password = parts[2];
-
-                if identity != "".as_bytes() && identity != username {
-                    return vec![Response::Status(
-                        Status::no(Some(command.tag), None, "Invalid identity").unwrap(),
-                    )];
-                }
-
-                match login(
-                    str::from_utf8(username).unwrap(),
-                    str::from_utf8(password).unwrap(),
+                let (username, password) = match auth::parse_plain_message(
+                    Secret::new(&line.0.declassify()),
+                    command.tag.clone(),
                 ) {
-                    Ok((id, token)) => {
-                        connection.state = State::Authenticated;
-                        connection.id = Some(id);
-                        connection.token = Some(token);
-                        return vec![Response::Status(
-                            Status::ok(
-                                Some(command.tag),
-                                Some(Code::Capability(capabilities())),
-                                "AUTHENTICATE completed",
-                            )
-                            .unwrap(),
-                        )];
+                    Ok(tup) => tup,
+                    Err(response) => {
+                        return response;
                     }
-                    Err(message) => {
-                        return vec![Response::Status(
-                            Status::no(
-                                Some(command.tag),
-                                None,
-                                match message {
-                                    Some(message) => format!("AUTHENTICATE failed: {}", message),
-                                    None => String::from("AUTHENTICATE failed"),
-                                },
-                            )
-                            .unwrap(),
-                        )];
-                    }
-                }
+                };
+
+                let (state, user, response) =
+                    auth::translate(api::login(client, username, password), command.tag);
+
+                connection.state = state;
+                connection.user = user;
+                return response;
             }
             Login { username, password } => {
-                match login(
-                    str::from_utf8(username.as_ref()).unwrap(),
-                    str::from_utf8(password.declassify().as_ref()).unwrap(),
-                ) {
-                    Ok((id, token)) => {
-                        connection.state = State::Authenticated;
-                        connection.id = Some(id);
-                        connection.token = Some(token);
-                        return vec![Response::Status(
-                            Status::ok(
-                                Some(command.tag),
-                                Some(Code::Capability(capabilities())),
-                                "LOGIN completed",
-                            )
-                            .unwrap(),
-                        )];
-                    }
-                    Err(message) => {
-                        return vec![Response::Status(
-                            Status::no(
-                                Some(command.tag),
-                                None,
-                                match message {
-                                    Some(message) => format!("LOGIN failed: {}", message),
-                                    None => String::from("LOGIN failed"),
-                                },
-                            )
-                            .unwrap(),
-                        )];
-                    }
-                }
+                let (state, user, response) = auth::translate(
+                    api::login(
+                        client,
+                        str::from_utf8(username.as_ref()).unwrap(),
+                        str::from_utf8(password.declassify().as_ref()).unwrap(),
+                    ),
+                    command.tag,
+                );
+
+                connection.state = state;
+                connection.user = user;
+                return response;
             }
             _ => (),
         }
@@ -406,8 +360,10 @@ fn process<'a>(
                     ];
                 }
 
+                // unwrap: on est en authenticated ou selected
+                let user = connection.user.clone().unwrap();
                 let mut response: Vec<_> = list(
-                    get_folders(connection.id.unwrap(), connection.token.clone().unwrap()),
+                    api::get_folders(client, user.id, &user.token),
                     reference,
                     name,
                 )
@@ -472,90 +428,6 @@ fn process<'a>(
     vec![Response::Status(
         Status::no(Some(command.tag), None, "Not supported!").unwrap(),
     )]
-}
-
-#[derive(Deserialize, Debug)]
-struct APIResponse<Data> {
-    host: Option<String>,
-    code: u32,
-    token: String,
-    message: Option<String>,
-    data: Data,
-}
-
-#[derive(Deserialize)]
-struct LoginData {
-    accounts: Vec<Account>,
-}
-
-#[derive(Deserialize)]
-struct Account {
-    id: u32,
-}
-
-fn capabilities() -> NonEmptyVec<Capability<'static>> {
-    use imap_types::{auth::AuthMechanism::*, response::Capability::*};
-    NonEmptyVec::try_from(vec![Imap4Rev1, Auth(Plain)]).unwrap()
-}
-
-fn login(username: &str, password: &str) -> Result<(u32, String), Option<String>> {
-    let body = json!({
-        "identifiant": username,
-        "motdepasse": password,
-    });
-
-    let client = reqwest::blocking::Client::new();
-    let response: APIResponse<LoginData> = client
-        .post("https://api.ecoledirecte.com/v3/login.awp?v=4.43.0")
-        .header(USER_AGENT, "ecoledirecte-imap")
-        .body("data=".to_owned() + &body.to_string())
-        .send()
-        .unwrap()
-        .json()
-        .unwrap();
-
-    if response.code == 200 {
-        Ok((response.data.accounts[0].id, response.token))
-    } else {
-        Err(response.message)
-    }
-}
-
-#[derive(Deserialize)]
-struct APIClasseurs {
-    classeurs: Vec<APIClasseur>,
-}
-
-#[derive(Deserialize)]
-struct APIClasseur {
-    id: u32,
-    libelle: String,
-}
-
-fn get_folders(id: u32, token: String) -> Vec<String> {
-    let body = json!({
-        "anneeMessage": "2022-2023", // TODO!!!
-    });
-
-    let client = reqwest::blocking::Client::new();
-    let response: APIResponse<APIClasseurs> = client
-        .post(format!(
-            "https://api.ecoledirecte.com/v3/eleves/{id}/messages.awp?verbe=get&v=4.43.0"
-        ))
-        .header(USER_AGENT, "ecoledirecte-imap")
-        .header("X-Token", token)
-        .body("data=".to_owned() + &body.to_string())
-        .send()
-        .unwrap()
-        .json()
-        .unwrap();
-
-    response
-        .data
-        .classeurs
-        .into_iter()
-        .map(|classeur| classeur.libelle)
-        .collect()
 }
 
 fn list(folders: Vec<String>, reference: Mailbox<'_>, mailbox_wildcard: &[u8]) -> Vec<String> {
