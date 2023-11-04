@@ -19,9 +19,9 @@ Commands implémentées (± par ordre de priorité) :
  - [x] Noop (facile à implémenter :p)
  - [x] Logout
  - [ ] List: Il reste la logique de tri à implémenter
- - [ ] Select
+ - [x] Select
  - [ ] Fetch
- - [ ] Close
+ - [x] Close
  - [ ] Examine
  - [ ] Create
  - [ ] Delete

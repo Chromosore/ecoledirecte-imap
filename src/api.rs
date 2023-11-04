@@ -59,23 +59,33 @@ pub fn login(
     }
 }
 
-pub fn get_folders(client: &Client, id: u32, token: &str) -> Vec<String> {
+pub fn get_folder_info(client: &Client, mailbox_id: u32, user_id: u32, token: &str) -> Value {
+    let mailbox_id = mailbox_id.to_string();
     let request = build_request(
         client,
         "get",
-        &format!("/v3/eleves/{id}/messages.awp"),
+        &format!("/v3/eleves/{user_id}/messages.awp"),
         {
-            let mut qs = HashMap::new();
-            qs.insert("idClasseur", "0");
+            let mut qs = HashMap::<&str, &str>::new();
+            qs.insert("idClasseur", &mailbox_id);
             qs
         },
         json!({}),
         token,
     );
-    request.send().unwrap().json::<Value>().unwrap()["data"]["classeurs"]
+    request.send().unwrap().json::<Value>().unwrap()["data"].take()
+}
+
+pub fn get_folders(client: &Client, id: u32, token: &str) -> Vec<(String, u32)> {
+    get_folder_info(client, 0, id, token)["classeurs"]
         .as_array()
         .unwrap()
         .into_iter()
-        .map(|classeur| classeur["libelle"].as_str().unwrap().to_string())
+        .map(|classeur| {
+            (
+                classeur["libelle"].as_str().unwrap().to_string(),
+                classeur["id"].as_u64().unwrap() as u32,
+            )
+        })
         .collect()
 }

@@ -4,9 +4,9 @@ use imap_codec::{
     imap_types::{
         self,
         auth::AuthMechanism,
+        bounded_static::IntoBoundedStatic,
         command::Command,
         core::Text,
-        flag::{Flag, FlagPerm},
         mailbox::{ListMailbox, Mailbox},
         response::{
             Code, CommandContinuationRequest, Data, Greeting, GreetingKind, Response, Status,
@@ -17,6 +17,7 @@ use imap_codec::{
     AuthenticateDataCodec, CommandCodec, GreetingCodec, ResponseCodec,
 };
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::ops::Range;
@@ -26,10 +27,12 @@ use std::thread;
 use ecoledirecte_imap::api;
 use ecoledirecte_imap::auth;
 use ecoledirecte_imap::capabilities;
+use ecoledirecte_imap::mailbox;
 
 struct Connection<'a> {
     state: State<'a>,
     user: Option<auth::User>,
+    folders: Option<HashMap<String, u32>>,
 }
 
 impl<'a> Default for Connection<'a> {
@@ -37,6 +40,7 @@ impl<'a> Default for Connection<'a> {
         Connection {
             state: State::Greeting,
             user: None,
+            folders: None,
         }
     }
 }
@@ -150,7 +154,7 @@ fn responder(
 
 fn process<'a>(
     command: Command<'a>,
-    connection: &mut Connection<'_>,
+    connection: &'a mut Connection<'_>,
     stream: &mut TcpStream,
     client: &reqwest::blocking::Client,
 ) -> Vec<Response<'a>> {
@@ -161,6 +165,7 @@ fn process<'a>(
         state::State::{Logout as LogoutState, *},
     };
 
+    // Déplacement partiel (tag reste possédé par command)
     match command.body {
         Capability => {
             return vec![
@@ -312,26 +317,59 @@ fn process<'a>(
     if let Authenticated | Selected(_) = connection.state {
         match command.body {
             Select { mailbox } => {
-                return vec![
-                    Response::Data(Data::Flags(vec![Flag::Seen, Flag::Answered, Flag::Draft])),
-                    Response::Data(Data::Exists(0)),
-                    Response::Data(Data::Recent(0)),
-                    Response::Status(
-                        Status::ok(
-                            None,
-                            Some(Code::PermanentFlags(vec![
-                                FlagPerm::Flag(Flag::Seen),
-                                FlagPerm::Flag(Flag::Draft),
-                            ])),
-                            "Flags",
-                        )
-                        .unwrap(),
-                    ),
-                    Response::Status(
-                        Status::ok(Some(command.tag), Some(Code::ReadWrite), "SELECT completed")
+                // unwrap: on est en authenticated ou selected
+                let user = connection.user.as_ref().unwrap();
+                if let None = connection.folders {
+                    let folders =
+                        mailbox::make_folders(api::get_folders(client, user.id, &user.token));
+                    connection.folders = Some(folders);
+                }
+                let folders = connection.folders.as_ref().unwrap();
+
+                let name = match mailbox {
+                    Mailbox::Inbox => "INBOX",
+                    Mailbox::Other(ref mailbox) => str::from_utf8(mailbox.as_ref()).unwrap(),
+                };
+                match folders.get(name) {
+                    Some(&id) => {
+                        let mut response = mailbox::mailbox_info(
+                            name,
+                            api::get_folder_info(client, id, user.id, &user.token),
+                        );
+                        response.push(Response::Status(
+                            Status::ok(
+                                Some(command.tag),
+                                Some(Code::ReadWrite),
+                                "SELECT completed",
+                            )
                             .unwrap(),
-                    ),
-                ];
+                        ));
+
+                        connection.state = State::Selected(mailbox.into_static());
+                        return response;
+                    }
+                    None => {
+                        let folders =
+                            mailbox::make_folders(api::get_folders(client, user.id, &user.token));
+                        connection.folders = Some(folders);
+                        let folders = connection.folders.as_ref().unwrap();
+                        if folders.contains_key(name) {
+                            return process(
+                                Command {
+                                    tag: command.tag,
+                                    body: Select { mailbox },
+                                },
+                                connection,
+                                stream,
+                                client,
+                            );
+                        } else {
+                            return vec![Response::Status(
+                                Status::no(Some(command.tag), None, "No such mailbox!").unwrap(),
+                            )];
+                        }
+                    }
+                }
             }
             Examine { mailbox } => todo!("EXAMINE {:?}", mailbox),
             Create { mailbox } => todo!("CREATE {:?}", mailbox),
@@ -361,27 +399,16 @@ fn process<'a>(
                 }
 
                 // unwrap: on est en authenticated ou selected
-                let user = connection.user.clone().unwrap();
-                let mut response: Vec<_> = list(
-                    api::get_folders(client, user.id, &user.token),
-                    reference,
-                    name,
-                )
-                .into_iter()
-                .map(|classeur: String| {
-                    Response::Data(Data::List {
-                        items: vec![],
-                        delimiter: None,
-                        mailbox: Mailbox::try_from(classeur).unwrap(),
-                    })
-                })
-                .collect();
+                let user = connection.user.as_ref().unwrap();
+                connection.folders = Some(mailbox::make_folders(api::get_folders(
+                    client,
+                    user.id,
+                    &user.token,
+                )));
+                let folders = connection.folders.as_ref().unwrap();
 
-                response.push(Response::Data(Data::List {
-                    items: vec![],
-                    delimiter: None,
-                    mailbox: Mailbox::Inbox,
-                }));
+                let mut response = mailbox::filter(folders, reference, name);
+
                 response.push(Response::Status(
                     Status::ok(Some(command.tag), None, "LIST completed").unwrap(),
                 ));
@@ -398,7 +425,12 @@ fn process<'a>(
     if let Selected(mailbox) = &connection.state {
         match command.body {
             Check => todo!("CHECK ({:?})", mailbox),
-            Close => todo!("CLOSE ({:?})", mailbox),
+            Close => {
+                connection.state = State::Authenticated;
+                return vec![Response::Status(
+                    Status::ok(Some(command.tag), None, "Mailbox closed").unwrap(),
+                )];
+            }
             Search {
                 charset,
                 criteria,
@@ -428,8 +460,4 @@ fn process<'a>(
     vec![Response::Status(
         Status::no(Some(command.tag), None, "Not supported!").unwrap(),
     )]
-}
-
-fn list(folders: Vec<String>, reference: Mailbox<'_>, mailbox_wildcard: &[u8]) -> Vec<String> {
-    folders // TODO!!!
 }
