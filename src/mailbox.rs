@@ -93,3 +93,77 @@ pub fn mailbox_info<'a, 'b>(mailbox: &'a str, folder: Value) -> Vec<Response<'b>
 
     response
 }
+
+pub fn translate_to_mailbox<'a>(mailbox: &'a str, folder: Value) {
+    let messages = match mailbox {
+        "Sent" => &folder["messages"]["sent"],
+        "Archived" => &folder["messages"]["archived"],
+        "Drafts" => &folder["messages"]["draft"],
+        _ => &folder["messages"]["received"],
+    }
+}
+
+pub fn to_folder<'a>(
+    folders: &HashMap<String, u32>, mailbox: Mailbox<'_>) -> Option<(u32, &'static str)> {
+    let name = match mailbox {
+        Mailbox::Inbox => "INBOX",
+        Mailbox::Other(mailbox) => str::from_utf8(mailbox.as_ref()).unwrap(),
+    };
+    match name {
+        "INBOX" => Some((0, "received")),
+        "Sent" => Some((0, "sent")),
+        "Archived" => Some((0, "archived")),
+        "Drafts" => Some((0, "draft")),
+        _ => folders.get(name).map(|id| (id, "received")),
+    }
+}
+
+pub fn paginate(min: u32, max: u32) -> (u32, u32) {
+    // Le problème ici est de déterminer la plus petite taille
+    // de page possible pour avoir une seule page qui contient
+    // tous les messages de min à max (inclus).
+    // Exemple : de 17 à 23, on trouve que la plus petite taille
+    // qui satisfait les contraintes est 8 : la page 3 contient
+    // les messages de 17 à 24.
+    // J'ai essayé de résoudre le problème d'un point de vu
+    // mathématique, sans trop de succès. Ce qui ressort,
+    // c'est que dans tous les cas, utiliser un page de taille
+    // max contiendra tous les messages de 1 à max et donc de
+    // min à max, mais c'est un peu du gachis. Cela dit on est
+    // obligé d'utiliser cette technique si max >= 2*min + 1
+    // Sinon la taille minimum de la page doit être évidemment
+    // max - min + 1 (le nombre de messages dans l'intervalle
+    // min..max).
+    // Une formalisation du problème si des gens sont éventuel-
+    // lement tentés de le résoudre est :
+    // Soient a et b deux entiers (min et max) avec 1 <= a <= b
+    // On cherche la plus petite valeur de n (taille de la page)
+    // telle qu'il existe un entier p (numéro de la page) tel que
+    // n*(p-1) + 1 <= a <= b <= n*p
+    // Pour l'instant, la solution consiste en vérifier si les entiers
+    // de (b - a + 1) à b fonctionnent. Comme dit précédemment, b
+    // fonctionne forcément.
+    // Donc complexité O(min)
+    for size in (max - min + 1)..max {
+        // max <= n*p
+        let page = ((max - 1) / size) + 1;
+        if size * (page - 1) + 1 <= min && max <= size * page {
+            return (page, size);
+        }
+    }
+    (1, max)
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    #[test]
+    fn test_pagination() {
+        assert_eq!(paginate(5, 5), (5, 1));
+        assert_eq!(paginate(1, 20), (1, 20));
+        assert_eq!(paginate(11, 20), (2, 10));
+        assert_eq!(paginate(5, 8), (2, 4));
+        assert_eq!(paginate(17, 23), (3, 8));
+        assert_eq!(paginate(5, 20), (1, 20));
+    }
+}

@@ -89,3 +89,23 @@ pub fn get_folders(client: &Client, id: u32, token: &str) -> Vec<(String, u32)> 
         })
         .collect()
 }
+
+pub fn get_folder_messages(client: &Client, mailbox_id: u32, message_type: &str, page: (u32, u32), user_id: u32, token: &str) -> Value {
+    let mailbox_id = mailbox_id.to_string();
+    let request = build_request(
+        client,
+        "get",
+        &format!("/v3/eleves/{user_id}/messages.awp"),
+        {
+            let mut qs = HashMap::<&str, &str>::new();
+            qs.insert("idClasseur", &mailbox_id);
+            qs.insert("typeRecuperation", message_type);
+            qs.insert("page", &page.0);
+            qs.insert("itemsPerPage", &page.1);
+            qs
+        },
+        json!({}),
+        token,
+    );
+    request.send().unwrap().json::<Value>().unwrap()["data"].take()
+}

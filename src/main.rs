@@ -7,6 +7,7 @@ use imap_codec::{
         bounded_static::IntoBoundedStatic,
         command::Command,
         core::Text,
+        fetch::{Macro, MacroOrMessageDataItemNames, MessageDataItemName},
         mailbox::{ListMailbox, Mailbox},
         response::{
             Code, CommandContinuationRequest, Data, Greeting, GreetingKind, Response, Status,
@@ -446,13 +447,27 @@ fn process<'a>(
                 sequence_set,
                 macro_or_item_names,
                 uid,
-            } => todo!(
-                "FETCH {:?} {:?} {:?} ({:?})",
-                sequence_set,
-                macro_or_item_names,
-                uid,
-                mailbox
-            ),
+            } => {
+                if (uid) {
+                    todo!("UID FETCH!!!");
+                }
+
+                let mut response = vec![];
+
+                let (folder, folder_type) = mailbox::to_folder(folders, mailbox);
+
+				for span in sequence_set.0.into_inner().iter() {
+    				let range = match span {
+        				Single(nr) => (nr, nr),
+        				Range(min, max) => (min, max),
+    				}
+
+    				let messages = api::get_folder_messages(client, mailbox_id, mailbox::paginate(range), user_id, token);
+    				response.extend(messages.map(|m| fetch::query(m, macro_or_item_names)));
+				}
+
+				return response;
+            }
             _ => (),
         }
     }
